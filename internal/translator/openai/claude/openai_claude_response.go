@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -61,7 +62,7 @@ type ToolCallAccumulator struct {
 //
 // Returns:
 //   - []string: A slice of strings, each containing an Anthropic-compatible JSON response.
-func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
+func ConvertOpenAIResponseToClaude(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
 	if *param == nil {
 		*param = &ConvertOpenAIResponseToAnthropicParams{
 			MessageID:               "",
@@ -74,6 +75,19 @@ func ConvertOpenAIResponseToClaude(_ context.Context, _ string, originalRequestR
 			ContentBlocksStopped:    false,
 			MessageDeltaSent:        false,
 		}
+	}
+
+	// Check if this is a web search response (non-streaming case)
+	// When handling streaming, the web search response should come as a single chunk
+	if isWebSearchResponse(rawJSON) || (bytes.HasPrefix(rawJSON, dataTag) && isWebSearchResponse(bytes.TrimSpace(rawJSON[5:]))) {
+		// For web search responses, create a single Claude message chunk
+		webSearchRaw := rawJSON
+		if bytes.HasPrefix(rawJSON, dataTag) {
+			webSearchRaw = bytes.TrimSpace(rawJSON[5:])
+		}
+
+		converted := convertWebSearchResponseToClaude(webSearchRaw, modelName)
+		return []string{converted}
 	}
 
 	if !bytes.HasPrefix(rawJSON, dataTag) {
@@ -339,6 +353,14 @@ func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams)
 
 // convertOpenAINonStreamingToAnthropic converts OpenAI non-streaming response to Anthropic format
 func convertOpenAINonStreamingToAnthropic(rawJSON []byte) []string {
+	// Check if this is a web search response
+	if isWebSearchResponse(rawJSON) {
+		// This shouldn't normally happen since web search responses are handled at the higher level,
+		// but just in case, create a proper Claude response
+		webSearchClaude := convertWebSearchResponseToClaude(rawJSON, "web-search-model")
+		return []string{webSearchClaude}
+	}
+
 	root := gjson.ParseBytes(rawJSON)
 
 	// Build Anthropic response
@@ -447,14 +469,19 @@ func mapOpenAIFinishReasonToAnthropic(openAIReason string) string {
 //
 // Returns:
 //   - string: An Anthropic-compatible JSON response.
-func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
+func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
 	_ = originalRequestRawJSON
 	_ = requestRawJSON
+
+	// Check if this is a web search response
+	if isWebSearchResponse(rawJSON) {
+		return convertWebSearchResponseToClaude(rawJSON, modelName)
+	}
 
 	root := gjson.ParseBytes(rawJSON)
 
 	response := map[string]interface{}{
-		"id":            root.Get("id").String(),
+		"id":            generateMessageID(),
 		"type":          "message",
 		"role":          "assistant",
 		"model":         root.Get("model").String(),
@@ -634,4 +661,108 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, _ string, origina
 
 func ClaudeTokenCount(ctx context.Context, count int64) string {
 	return fmt.Sprintf(`{"input_tokens":%d}`, count)
+}
+
+// isWebSearchResponse checks if the raw JSON response is a web search response
+// by looking for distinctive fields like "data" array which is typical in web search responses
+func isWebSearchResponse(rawJSON []byte) bool {
+	root := gjson.ParseBytes(rawJSON)
+	// Check if response has the "data" array field which is characteristic of web search results
+	return root.Get("data").Exists() && root.Get("data").IsArray()
+}
+
+// convertWebSearchResponseToClaude converts a web search response (like from /chat/retrieve)
+// to Claude-compatible message format
+func convertWebSearchResponseToClaude(rawJSON []byte, originalModelName string) string {
+	root := gjson.ParseBytes(rawJSON)
+
+	// Create a Claude message response
+	response := map[string]interface{}{
+		"id":            generateMessageID(),
+		"type":          "message",
+		"role":          "assistant",
+		"model":         originalModelName, // Use the original model name
+		"content":       []interface{}{},
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		"usage": map[string]interface{}{
+			"input_tokens":  0,
+			"output_tokens": 0,
+		},
+	}
+
+	// Build content with search results
+	contentBlocks := make([]interface{}, 0)
+
+	// Get search results from "data" array
+	dataResults := root.Get("data")
+	if dataResults.Exists() && dataResults.IsArray() {
+		results := dataResults.Array()
+		if len(results) > 0 {
+			// Create a summary content block with search results
+			var searchSummary strings.Builder
+			for i, result := range results {
+				if i > 0 {
+					searchSummary.WriteString("\n\n") // Separate results clearly
+				}
+
+				title := result.Get("title").String()
+				url := result.Get("url").String()
+				abstract := result.Get("abstractInfo").String()
+
+				// Add the result to summary
+				if title != "" {
+					searchSummary.WriteString("## ")
+					searchSummary.WriteString(title)
+					searchSummary.WriteString("\n")
+				}
+				if url != "" {
+					searchSummary.WriteString("URL: ")
+					searchSummary.WriteString(url)
+					searchSummary.WriteString("\n")
+				}
+				if abstract != "" {
+					// Limit the abstract length to avoid very long responses
+					cleanAbstract := strings.ReplaceAll(abstract, "<[^>]*>", "") // Remove HTML tags
+					if len(cleanAbstract) > 500 {
+						cleanAbstract = cleanAbstract[:500] + "..."
+					}
+					searchSummary.WriteString(cleanAbstract)
+				}
+			}
+
+			// Create a text content block with the search results
+			contentBlock := map[string]interface{}{
+				"type": "text",
+				"text": searchSummary.String(),
+			}
+			contentBlocks = append(contentBlocks, contentBlock)
+		}
+	}
+
+	response["content"] = contentBlocks
+
+	// Marshal to JSON
+	responseJSON, err := json.Marshal(response)
+	if err != nil {
+		// Fallback: return empty Claude response
+		fallback := fmt.Sprintf(`{
+			"id": "%s",
+			"type": "message",
+			"role": "assistant",
+			"model": "web-search-model",
+			"content": [{"type": "text", "text": "Web search completed."}],
+			"stop_reason": "end_turn",
+			"stop_sequence": null,
+			"usage": {"input_tokens": 0, "output_tokens": 0}
+		}`, generateMessageID())
+		return fallback
+	}
+
+	return string(responseJSON)
+}
+
+// generateMessageID creates a unique message ID for Claude responses
+func generateMessageID() string {
+	return "msg_" + strings.ReplaceAll(uuid.New().String(), "-", "")
 }

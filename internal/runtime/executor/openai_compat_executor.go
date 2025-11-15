@@ -58,7 +58,16 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	}
 	translated = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", translated)
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	// Check if this is a web search request (has special marker we added in translator)
+	isWebSearch := isWebSearchRequest(translated)
+
+	var url string
+	if isWebSearch {
+		url = strings.TrimSuffix(baseURL, "/") + "/chat/retrieve"
+	} else {
+		url = strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
@@ -116,12 +125,23 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		return resp, err
 	}
 	appendAPIResponseChunk(ctx, e.cfg, body)
-	reporter.publish(ctx, parseOpenAIUsage(body))
-	// Ensure we at least record the request even if upstream doesn't return usage
-	reporter.ensurePublished(ctx)
-	// Translate response back to source format when needed
+
+	// Handle web search responses differently from standard OpenAI responses
+	var out string
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
+	if isWebSearch {
+		// For web search responses, we need to format them properly for Claude
+		// The /chat/retrieve endpoint returns a different format than OpenAI
+		out = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
+	} else {
+		// Standard OpenAI response handling
+		reporter.publish(ctx, parseOpenAIUsage(body))
+		// Ensure we at least record the request even if upstream doesn't return usage
+		reporter.ensurePublished(ctx)
+		// Translate response back to source format when needed
+		out = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
+	}
+
 	resp = cliproxyexecutor.Response{Payload: []byte(out)}
 	return resp, nil
 }
@@ -143,7 +163,16 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 	translated = applyPayloadConfigWithRoot(e.cfg, req.Model, to.String(), "", translated)
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	// Check if this is a web search request (has special marker we added in translator)
+	isWebSearch := isWebSearchRequest(translated)
+
+	var url string
+	if isWebSearch {
+		url = strings.TrimSuffix(baseURL, "/") + "/chat/retrieve"
+	} else {
+		url = strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	}
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -158,8 +187,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(httpReq, attrs)
-	httpReq.Header.Set("Accept", "text/event-stream")
-	httpReq.Header.Set("Cache-Control", "no-cache")
+
+	// For web search, we don't want stream headers as it returns a complete response
+	if !isWebSearch {
+		httpReq.Header.Set("Accept", "text/event-stream")
+		httpReq.Header.Set("Cache-Control", "no-cache")
+	}
 	var authID, authLabel, authType, authValue string
 	if auth != nil {
 		authID = auth.ID
@@ -195,6 +228,7 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return nil, err
 	}
+
 	out := make(chan cliproxyexecutor.StreamChunk)
 	stream = out
 	go func() {
@@ -204,33 +238,57 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				log.Errorf("openai compat executor: close response body error: %v", errClose)
 			}
 		}()
-		scanner := bufio.NewScanner(httpResp.Body)
-		buf := make([]byte, 20_971_520)
-		scanner.Buffer(buf, 20_971_520)
-		var param any
-		for scanner.Scan() {
-			line := scanner.Bytes()
-			appendAPIResponseChunk(ctx, e.cfg, line)
-			if detail, ok := parseOpenAIStreamUsage(line); ok {
-				reporter.publish(ctx, detail)
+
+		// For web search requests, the response is a single JSON rather than an SSE stream
+		if isWebSearch {
+			// Read the complete response body at once, since /chat/retrieve returns complete JSON
+			body, err := io.ReadAll(httpResp.Body)
+			if err != nil {
+				recordAPIResponseError(ctx, e.cfg, err)
+				reporter.publishFailure(ctx)
+				out <- cliproxyexecutor.StreamChunk{Err: err}
+				return
 			}
-			if len(line) == 0 {
-				continue
-			}
-			// OpenAI-compatible streams are SSE: lines typically prefixed with "data: ".
-			// Pass through translator; it yields one or more chunks for the target schema.
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, bytes.Clone(line), &param)
+
+			appendAPIResponseChunk(ctx, e.cfg, body)
+
+			// Translate the single web search response
+			// The response translator should handle web search response format
+			var param any
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}
+		} else {
+			// For regular OpenAI-compatible streaming responses
+			scanner := bufio.NewScanner(httpResp.Body)
+			buf := make([]byte, 20_971_520)
+			scanner.Buffer(buf, 20_971_520)
+			var param any
+			for scanner.Scan() {
+				line := scanner.Bytes()
+				appendAPIResponseChunk(ctx, e.cfg, line)
+				if detail, ok := parseOpenAIStreamUsage(line); ok {
+					reporter.publish(ctx, detail)
+				}
+				if len(line) == 0 {
+					continue
+				}
+				// OpenAI-compatible streams are SSE: lines typically prefixed with "data: ".
+				// Pass through translator; it yields one or more chunks for the target schema.
+				chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, bytes.Clone(line), &param)
+				for i := range chunks {
+					out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
+				}
+			}
+			if errScan := scanner.Err(); errScan != nil {
+				recordAPIResponseError(ctx, e.cfg, errScan)
+				reporter.publishFailure(ctx)
+				out <- cliproxyexecutor.StreamChunk{Err: errScan}
+			}
+			// Ensure we record the request if no usage chunk was ever seen
+			reporter.ensurePublished(ctx)
 		}
-		if errScan := scanner.Err(); errScan != nil {
-			recordAPIResponseError(ctx, e.cfg, errScan)
-			reporter.publishFailure(ctx)
-			out <- cliproxyexecutor.StreamChunk{Err: errScan}
-		}
-		// Ensure we record the request if no usage chunk was ever seen
-		reporter.ensurePublished(ctx)
 	}()
 	return stream, nil
 }
@@ -352,3 +410,11 @@ func (e statusErr) Error() string {
 	return fmt.Sprintf("status %d", e.code)
 }
 func (e statusErr) StatusCode() int { return e.code }
+
+// isWebSearchRequest checks if the translated request is a web search request
+// by looking for the special marker we add in ConvertClaudeRequestToOpenAI
+func isWebSearchRequest(translated []byte) bool {
+	// Check if the translated request has the web search marker
+	// This looks for the "_web_search_request":true field we add
+	return bytes.Contains(translated, []byte("\"_web_search_request\":true"))
+}
