@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -423,9 +424,30 @@ func (e statusErr) Error() string {
 func (e statusErr) StatusCode() int { return e.code }
 
 // isWebSearchRequest checks if the translated request is a web search request
-// by looking for the special marker we add in ConvertClaudeRequestToOpenAI
+// by checking if it has exactly one tool that matches /^web_search/ or if it has the special marker
 func isWebSearchRequest(translated []byte) bool {
-	// Check if the translated request has the web search marker
-	// This looks for the "_web_search_request":true field we add
-	return bytes.Contains(translated, []byte("\"_web_search_request\":true"))
+	// First check for the special marker that the translator adds
+	if bytes.Contains(translated, []byte("\"_web_search_request\":true")) {
+		return true
+	}
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(translated, &req); err != nil {
+		return false
+	}
+
+	// Check if tools exist and is an array
+	tools, ok := req["tools"].([]interface{})
+	if !ok || len(tools) != 1 {
+		return false
+	}
+
+	// Check if the single tool has a type that matches /^web_search/
+	if tool, ok := tools[0].(map[string]interface{}); ok {
+		if toolType, ok := tool["type"].(string); ok {
+			return strings.HasPrefix(toolType, "web_search")
+		}
+	}
+
+	return false
 }
