@@ -39,7 +39,7 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	ContentBlocksStopped bool
 	// Track if message_delta has been sent
 	MessageDeltaSent bool
-	// Track if message_start has been sent
+	// Track if message start has been sent
 	MessageStarted bool
 }
 
@@ -78,45 +78,43 @@ func ConvertOpenAIResponseToClaude(_ context.Context, modelName string, original
 		}
 	}
 
-	// Check if this is a web search response
-	// This can be either raw JSON (non-streaming context) or prefixed with dataTag (streaming context)
-	root := gjson.ParseBytes(rawJSON)
-	if root.Get("data").Exists() && root.Get("data").IsArray() {
-		// This is a web search response - treat it as SSE events for streaming contexts
-		return convertWebSearchResponseToClaudeSSE(rawJSON, modelName, (*param).(*ConvertOpenAIResponseToAnthropicParams))
-	}
-
-	// Check if it's data-tag prefixed - if so, extract the JSON part
-	if bytes.HasPrefix(rawJSON, dataTag) {
-		jsonPart := bytes.TrimSpace(rawJSON[5:])
-		// Check if the content part is a web search response
-		if isWebSearchResponse(jsonPart) {
-			return convertWebSearchResponseToClaudeSSE(jsonPart, modelName, (*param).(*ConvertOpenAIResponseToAnthropicParams))
-		}
-
-		rawJSON = jsonPart
-	} else if bytes.HasPrefix(rawJSON, []byte("data: ")) {
-		// Handle different data prefix pattern if needed
-		jsonPart := bytes.TrimSpace(rawJSON[6:])
-		if isWebSearchResponse(jsonPart) {
-			return convertWebSearchResponseToClaudeSSE(jsonPart, modelName, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+	// Check if this is a web search response (non-streaming case)
+	// When handling streaming, the web search response should come as a single chunk
+	if isWebSearchResponse(rawJSON) || (bytes.HasPrefix(rawJSON, dataTag) && isWebSearchResponse(bytes.TrimSpace(rawJSON[5:]))) {
+		// For web search responses in streaming context, we need to generate SSE events
+		// If this is a data-tag prefixed response, process as a streaming chunk
+		if bytes.HasPrefix(rawJSON, dataTag) {
+			webSearchRaw := bytes.TrimSpace(rawJSON[5:])
+			// Also check the original request was streaming to determine format
+			streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
+			isStream := streamResult.Exists() && streamResult.Type != gjson.False
+			if isStream {
+				return convertWebSearchResponseToClaudeSSE(webSearchRaw, modelName, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+			} else {
+				// Non-streaming context, return the complete Claude message
+				converted := convertWebSearchResponseToClaude(webSearchRaw, modelName)
+				return []string{converted}
+			}
+		} else {
+			// This is unprefixed web search response - check if original request was streaming
+			streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
+			isStream := streamResult.Exists() && streamResult.Type != gjson.False
+			if isStream {
+				// Original request was streaming, convert to SSE events
+				return convertWebSearchResponseToClaudeSSE(rawJSON, modelName, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+			} else {
+				// Non-streaming context, return the complete Claude message
+				converted := convertWebSearchResponseToClaude(rawJSON, modelName)
+				return []string{converted}
+			}
 		}
 	}
 
 	// Non-web-search response handling continues normally
-	if !bytes.HasPrefix(rawJSON, dataTag) && !bytes.HasPrefix(rawJSON, []byte("data: ")) {
-		if bytes.HasPrefix(rawJSON, []byte("[DONE]")) || string(rawJSON) == "[DONE]" {
-			return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
-		}
+	if !bytes.HasPrefix(rawJSON, dataTag) {
 		return convertOpenAINonStreamingToAnthropic(rawJSON)
 	}
-
-	// Trim data tag if present
-	if bytes.HasPrefix(rawJSON, dataTag) {
-		rawJSON = bytes.TrimSpace(rawJSON[5:])
-	} else if bytes.HasPrefix(rawJSON, []byte("data: ")) {
-		rawJSON = bytes.TrimSpace(rawJSON[6:])
-	}
+	rawJSON = bytes.TrimSpace(rawJSON[5:])
 
 	// Check if this is the [DONE] marker
 	rawStr := strings.TrimSpace(string(rawJSON))
@@ -124,12 +122,36 @@ func ConvertOpenAIResponseToClaude(_ context.Context, modelName string, original
 		return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
 	}
 
-	streamResult := gjson.GetBytes(originalRequestRawJSON, "stream")
-	if !streamResult.Exists() || (streamResult.Exists() && streamResult.Type == gjson.False) {
-		return convertOpenAINonStreamingToAnthropic(rawJSON)
-	} else {
-		return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+	return convertOpenAIStreamingChunkToAnthropic(rawJSON, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+}
+
+// convertOpenAIDoneToAnthropic handles the [DONE] marker and sends final events
+func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams) []string {
+	var results []string
+
+	// If we haven't sent message_delta yet (no usage info was received), send it now
+	if param.FinishReason != "" && !param.MessageDeltaSent {
+		messageDelta := map[string]interface{}{
+			"type": "message_delta",
+			"delta": map[string]interface{}{
+				"stop_reason":   mapOpenAIFinishReasonToAnthropic(param.FinishReason),
+				"stop_sequence": nil,
+			},
+			"usage": map[string]interface{}{
+				"input_tokens":  0,
+				"output_tokens": param.ContentAccumulator.Len() / 4, // Rough approximation
+			},
+		}
+
+		messageDeltaJSON, _ := json.Marshal(messageDelta)
+		results = append(results, "event: message_delta\ndata: "+string(messageDeltaJSON)+"\n\n")
+		param.MessageDeltaSent = true
 	}
+
+	// Send message_stop
+	results = append(results, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+
+	return results
 }
 
 // convertOpenAIStreamingChunkToAnthropic converts OpenAI streaming chunk to Anthropic streaming events
@@ -140,6 +162,9 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 	// Initialize parameters if needed
 	if param.MessageID == "" {
 		param.MessageID = root.Get("id").String()
+		if param.MessageID == "" {
+			param.MessageID = generateMessageID()
+		}
 	}
 	if param.Model == "" {
 		param.Model = root.Get("model").String()
@@ -148,10 +173,10 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		param.CreatedAt = root.Get("created").Int()
 	}
 
+	// Handle standard OpenAI streaming format
 	// Check if this is the first chunk (has role)
 	if delta := root.Get("choices.0.delta"); delta.Exists() {
 		if role := delta.Get("role"); role.Exists() && role.String() == "assistant" && !param.MessageStarted {
-			// Send message_start event
 			messageStart := map[string]interface{}{
 				"type": "message_start",
 				"message": map[string]interface{}{
@@ -175,7 +200,6 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			// Don't send content_block_start for text here - wait for actual content
 		}
 
-		// Handle content delta
 		if content := delta.Get("content"); content.Exists() && content.String() != "" {
 			// Send content_block_start for text if not already sent
 			if !param.TextContentBlockStarted {
@@ -272,7 +296,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 		}
 	}
 
-	// Handle finish_reason (but don't send message_delta/message_stop yet)
+	// Handle finish_reason (send message_delta and stop events)
 	if finishReason := root.Get("choices.0.finish_reason"); finishReason.Exists() && finishReason.String() != "" {
 		reason := finishReason.String()
 		param.FinishReason = reason
@@ -285,10 +309,19 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			}
 			contentBlockStopJSON, _ := json.Marshal(contentBlockStop)
 			results = append(results, "event: content_block_stop\ndata: "+string(contentBlockStopJSON)+"\n\n")
+
+			// Add ping event after content is stopped to follow Claude protocol sequence
+			pingEvent := `event: ping
+data: {"type": "ping"}
+
+`
+			results = append(results, pingEvent)
+
+			param.ContentBlocksStopped = true
 		}
 
 		// Send content_block_stop for any tool calls
-		if !param.ContentBlocksStopped {
+		if param.ToolCallsAccumulator != nil && !param.ContentBlocksStopped {
 			for index := range param.ToolCallsAccumulator {
 				accumulator := param.ToolCallsAccumulator[index]
 
@@ -316,60 +349,61 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 			param.ContentBlocksStopped = true
 		}
 
-		// Don't send message_delta here - wait for usage info or [DONE]
-	}
+		// Handle usage information if available in this chunk
+		if usage := root.Get("usage"); usage.Exists() && usage.Type != gjson.Null && !param.MessageDeltaSent {
+			promptTokens := usage.Get("prompt_tokens")
+			completionTokens := usage.Get("completion_tokens")
 
-	// Handle usage information separately (this comes in a later chunk)
-	// Only process if usage has actual values (not null)
-	if usage := root.Get("usage"); usage.Exists() && usage.Type != gjson.Null && param.FinishReason != "" {
-		// Check if usage has actual token counts
-		promptTokens := usage.Get("prompt_tokens")
-		completionTokens := usage.Get("completion_tokens")
+			if promptTokens.Exists() || completionTokens.Exists() {
+				// Send message_delta with usage
+				messageDelta := map[string]interface{}{
+					"type": "message_delta",
+					"delta": map[string]interface{}{
+						"stop_reason":   mapOpenAIFinishReasonToAnthropic(param.FinishReason),
+						"stop_sequence": nil,
+					},
+					"usage": map[string]interface{}{
+						"input_tokens":  promptTokens.Int(),
+						"output_tokens": completionTokens.Int(),
+					},
+				}
 
-		if promptTokens.Exists() && completionTokens.Exists() {
-			// Send message_delta with usage
-			messageDelta := map[string]interface{}{
-				"type": "message_delta",
-				"delta": map[string]interface{}{
-					"stop_reason":   mapOpenAIFinishReasonToAnthropic(param.FinishReason),
-					"stop_sequence": nil,
-				},
-				"usage": map[string]interface{}{
-					"input_tokens":  promptTokens.Int(),
-					"output_tokens": completionTokens.Int(),
-				},
+				messageDeltaJSON, _ := json.Marshal(messageDelta)
+				results = append(results, "event: message_delta\ndata: "+string(messageDeltaJSON)+"\n\n")
+				param.MessageDeltaSent = true
 			}
+		}
+	} else if usage := root.Get("usage"); usage.Exists() && usage.Type != gjson.Null {
+		// Handle case where usage is sent in a separate chunk without finish_reason
+		// This can happen in some streaming implementations
+		if !param.MessageDeltaSent {
+			promptTokens := usage.Get("prompt_tokens")
+			completionTokens := usage.Get("completion_tokens")
 
-			messageDeltaJSON, _ := json.Marshal(messageDelta)
-			results = append(results, "event: message_delta\ndata: "+string(messageDeltaJSON)+"\n\n")
-			param.MessageDeltaSent = true
+			if promptTokens.Exists() || completionTokens.Exists() {
+				stopReason := "end_turn"
+				if param.FinishReason != "" {
+					stopReason = mapOpenAIFinishReasonToAnthropic(param.FinishReason)
+				}
+
+				messageDelta := map[string]interface{}{
+					"type": "message_delta",
+					"delta": map[string]interface{}{
+						"stop_reason":   stopReason,
+						"stop_sequence": nil,
+					},
+					"usage": map[string]interface{}{
+						"input_tokens":  promptTokens.Int(),
+						"output_tokens": completionTokens.Int(),
+					},
+				}
+
+				messageDeltaJSON, _ := json.Marshal(messageDelta)
+				results = append(results, "event: message_delta\ndata: "+string(messageDeltaJSON)+"\n\n")
+				param.MessageDeltaSent = true
+			}
 		}
 	}
-
-	return results
-}
-
-// convertOpenAIDoneToAnthropic handles the [DONE] marker and sends final events
-func convertOpenAIDoneToAnthropic(param *ConvertOpenAIResponseToAnthropicParams) []string {
-	var results []string
-
-	// If we haven't sent message_delta yet (no usage info was received), send it now
-	if param.FinishReason != "" && !param.MessageDeltaSent {
-		messageDelta := map[string]interface{}{
-			"type": "message_delta",
-			"delta": map[string]interface{}{
-				"stop_reason":   mapOpenAIFinishReasonToAnthropic(param.FinishReason),
-				"stop_sequence": nil,
-			},
-		}
-
-		messageDeltaJSON, _ := json.Marshal(messageDelta)
-		results = append(results, "event: message_delta\ndata: "+string(messageDeltaJSON)+"\n\n")
-		param.MessageDeltaSent = true
-	}
-
-	// Send message_stop
-	results = append(results, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 
 	return results
 }
@@ -385,7 +419,6 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) []string {
 	}
 
 	root := gjson.ParseBytes(rawJSON)
-
 	// Build Anthropic response
 	response := map[string]interface{}{
 		"id":            root.Get("id").String(),
@@ -503,8 +536,9 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, modelName string,
 
 	root := gjson.ParseBytes(rawJSON)
 
+	// Build Anthropic response
 	response := map[string]interface{}{
-		"id":            generateMessageID(),
+		"id":            root.Get("id").String(),
 		"type":          "message",
 		"role":          "assistant",
 		"model":         root.Get("model").String(),
@@ -517,8 +551,8 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, modelName string,
 		},
 	}
 
-	contentBlocks := make([]interface{}, 0)
-	hasToolCall := false
+	// Process message content and tool calls
+	var contentBlocks []interface{}
 
 	if choices := root.Get("choices"); choices.Exists() && choices.IsArray() && len(choices.Array()) > 0 {
 		choice := choices.Array()[0]
@@ -567,7 +601,6 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, modelName string,
 							toolCalls := item.Get("tool_calls")
 							if toolCalls.IsArray() {
 								toolCalls.ForEach(func(_, tc gjson.Result) bool {
-									hasToolCall = true
 									toolUse := map[string]interface{}{
 										"type": "tool_use",
 										"id":   tc.Get("id").String(),
@@ -616,7 +649,6 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, modelName string,
 
 			if toolCalls := message.Get("tool_calls"); toolCalls.Exists() && toolCalls.IsArray() {
 				toolCalls.ForEach(func(_, toolCall gjson.Result) bool {
-					hasToolCall = true
 					toolUseBlock := map[string]interface{}{
 						"type": "tool_use",
 						"id":   toolCall.Get("id").String(),
@@ -653,7 +685,16 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, modelName string,
 		response["usage"] = parsedUsage
 	}
 
+	var hasToolCall bool = false
 	if response["stop_reason"] == nil {
+		if toolBlocks := response["content"].([]interface{}); len(toolBlocks) > 0 {
+			for _, block := range toolBlocks {
+				if m, ok := block.(map[string]interface{}); ok && m["type"] == "tool_use" {
+					hasToolCall = true
+					break
+				}
+			}
+		}
 		if hasToolCall {
 			response["stop_reason"] = "tool_use"
 		} else {
@@ -679,6 +720,7 @@ func ConvertOpenAIResponseToClaudeNonStream(_ context.Context, modelName string,
 	if err != nil {
 		return ""
 	}
+
 	return string(responseJSON)
 }
 
@@ -692,6 +734,97 @@ func isWebSearchResponse(rawJSON []byte) bool {
 	root := gjson.ParseBytes(rawJSON)
 	// Check if response has the "data" array field which is characteristic of web search results
 	return root.Get("data").Exists() && root.Get("data").IsArray()
+}
+
+// convertWebSearchResponseToClaude converts a web search response (like from /chat/retrieve)
+// to Claude-compatible message format
+func convertWebSearchResponseToClaude(rawJSON []byte, originalModelName string) string {
+	root := gjson.ParseBytes(rawJSON)
+
+	// Create a Claude message response
+	response := map[string]interface{}{
+		"id":            generateMessageID(),
+		"type":          "message",
+		"role":          "assistant",
+		"model":         originalModelName, // Use the original model name
+		"content":       []interface{}{},
+		"stop_reason":   "end_turn",
+		"stop_sequence": nil,
+		"usage": map[string]interface{}{
+			"input_tokens":  0,
+			"output_tokens": 0,
+		},
+	}
+
+	// Build content with search results
+	contentBlocks := make([]interface{}, 0)
+
+	// Get search results from "data" array
+	dataResults := root.Get("data")
+	if dataResults.Exists() && dataResults.IsArray() {
+		results := dataResults.Array()
+		if len(results) > 0 {
+			// Create a summary content block with search results
+			var searchSummary strings.Builder
+			for i, result := range results {
+				if i > 0 {
+					searchSummary.WriteString("\n\n") // Separate results clearly
+				}
+
+				title := result.Get("title").String()
+				url := result.Get("url").String()
+				abstract := result.Get("abstractInfo").String()
+
+				// Add the result to summary
+				if title != "" {
+					searchSummary.WriteString("## ")
+					searchSummary.WriteString(title)
+					searchSummary.WriteString("\n")
+				}
+				if url != "" {
+					searchSummary.WriteString("URL: ")
+					searchSummary.WriteString(url)
+					searchSummary.WriteString("\n")
+				}
+				if abstract != "" {
+					// Limit the abstract length to avoid very long responses
+					cleanAbstract := strings.ReplaceAll(abstract, "<[^>]*>", "") // Remove HTML tags
+					if len(cleanAbstract) > 500 {
+						cleanAbstract = cleanAbstract[:500] + "..."
+					}
+					searchSummary.WriteString(cleanAbstract)
+				}
+			}
+
+			// Create a text content block with the search results
+			contentBlock := map[string]interface{}{
+				"type": "text",
+				"text": searchSummary.String(),
+			}
+			contentBlocks = append(contentBlocks, contentBlock)
+		}
+	}
+
+	response["content"] = contentBlocks
+
+	// Marshal to JSON
+	responseJSON, err := json.Marshal(response)
+	if err != nil {
+		// Fallback: return empty Claude response
+		fallback := fmt.Sprintf(`{
+			"id": "%s",
+			"type": "message",
+			"role": "assistant",
+			"model": "web-search-model",
+			"content": [{"type": "text", "text": "Web search completed."}],
+			"stop_reason": "end_turn",
+			"stop_sequence": null,
+			"usage": {"input_tokens": 0, "output_tokens": 0}
+		}`, generateMessageID())
+		return fallback
+	}
+
+	return string(responseJSON)
 }
 
 // convertWebSearchResponseToClaudeSSE converts a web search response to Claude SSE events
@@ -788,7 +921,6 @@ func convertWebSearchResponseToClaudeSSE(rawJSON []byte, originalModelName strin
 
 		// Send content_block_delta with the content in chunks (to simulate streaming)
 		if len(contentText) > 0 {
-			// Break content into smaller chunks to better simulate streaming
 			// Break content into reasonable-sized chunks to simulate streaming (avoiding tiny chunks)
 			charsPerChunk := 100
 			for i := 0; i < len(contentText); i += charsPerChunk {
@@ -848,97 +980,6 @@ func convertWebSearchResponseToClaudeSSE(rawJSON []byte, originalModelName strin
 	results = append(results, "event: message_stop\ndata: "+string(messageStopJSON)+"\n\n")
 
 	return results
-}
-
-// convertWebSearchResponseToClaude converts a web search response (like from /chat/retrieve)
-// to Claude-compatible message format (the complete message, used in non-streaming contexts)
-func convertWebSearchResponseToClaude(rawJSON []byte, originalModelName string) string {
-	root := gjson.ParseBytes(rawJSON)
-
-	// Create a Claude message response
-	response := map[string]interface{}{
-		"id":            generateMessageID(),
-		"type":          "message",
-		"role":          "assistant",
-		"model":         originalModelName, // Use the original model name
-		"content":       []interface{}{},
-		"stop_reason":   "end_turn",
-		"stop_sequence": nil,
-		"usage": map[string]interface{}{
-			"input_tokens":  0,
-			"output_tokens": 0,
-		},
-	}
-
-	// Build content with search results
-	contentBlocks := make([]interface{}, 0)
-
-	// Get search results from "data" array
-	dataResults := root.Get("data")
-	if dataResults.Exists() && dataResults.IsArray() {
-		results := dataResults.Array()
-		if len(results) > 0 {
-			// Create a summary content block with search results
-			var searchSummary strings.Builder
-			for i, result := range results {
-				if i > 0 {
-					searchSummary.WriteString("\n\n") // Separate results clearly
-				}
-
-				title := result.Get("title").String()
-				url := result.Get("url").String()
-				abstract := result.Get("abstractInfo").String()
-
-				// Add the result to summary
-				if title != "" {
-					searchSummary.WriteString("## ")
-					searchSummary.WriteString(title)
-					searchSummary.WriteString("\n")
-				}
-				if url != "" {
-					searchSummary.WriteString("URL: ")
-					searchSummary.WriteString(url)
-					searchSummary.WriteString("\n")
-				}
-				if abstract != "" {
-					// Limit the abstract length to avoid very long responses
-					cleanAbstract := strings.ReplaceAll(abstract, "<[^>]*>", "") // Remove HTML tags
-					if len(cleanAbstract) > 500 {
-						cleanAbstract = cleanAbstract[:500] + "..."
-					}
-					searchSummary.WriteString(cleanAbstract)
-				}
-			}
-
-			// Create a text content block with the search results
-			contentBlock := map[string]interface{}{
-				"type": "text",
-				"text": searchSummary.String(),
-			}
-			contentBlocks = append(contentBlocks, contentBlock)
-		}
-	}
-
-	response["content"] = contentBlocks
-
-	// Marshal to JSON
-	responseJSON, err := json.Marshal(response)
-	if err != nil {
-		// Fallback: return empty Claude response
-		fallback := fmt.Sprintf(`{
-			"id": "%s",
-			"type": "message",
-			"role": "assistant",
-			"model": "web-search-model",
-			"content": [{"type": "text", "text": "Web search completed."}],
-			"stop_reason": "end_turn",
-			"stop_sequence": null,
-			"usage": {"input_tokens": 0, "output_tokens": 0}
-		}`, generateMessageID())
-		return fallback
-	}
-
-	return string(responseJSON)
 }
 
 // generateMessageID creates a unique message ID for Claude responses
