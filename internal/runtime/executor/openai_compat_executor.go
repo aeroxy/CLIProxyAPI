@@ -68,6 +68,9 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		url = strings.TrimSuffix(baseURL, "/") + "/chat/completions"
 	}
 
+	log.Debugf("OpenAICompatExecutor ExecuteStream: Request ID: %s, %s endpoint, model: %s, isWebSearch: %t", req.Model, url, req.Model, isWebSearch)
+	log.Debugf("OpenAICompatExecutor ExecuteStream: payload: %s", string(translated))
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return resp, err
@@ -112,10 +115,11 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		}
 	}()
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	log.Debugf("OpenAICompatExecutor Execute: HTTP Response status: %d, headers: %v", httpResp.StatusCode, httpResp.Header)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		log.Debugf("OpenAICompatExecutor Execute: request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
 		return resp, err
 	}
@@ -130,9 +134,12 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	var out string
 	var param any
 	if isWebSearch {
+		log.Debugf("OpenAICompatExecutor Execute: Web search response received, request model: %s, raw response: %s", req.Model, string(body))
 		// For web search responses, we need to format them properly for Claude
 		// The /chat/retrieve endpoint returns a different format than OpenAI
-		out = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
+		translatedOut := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
+		log.Debugf("OpenAICompatExecutor Execute: Web search response translated to: %s", translatedOut)
+		out = translatedOut
 	} else {
 		// Standard OpenAI response handling
 		reporter.publish(ctx, parseOpenAIUsage(body))
@@ -141,6 +148,7 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 		// Translate response back to source format when needed
 		out = sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
 	}
+	log.Debugf("OpenAICompatExecutor Execute: Response translated to: %s", out)
 
 	resp = cliproxyexecutor.Response{Payload: []byte(out)}
 	return resp, nil
@@ -218,10 +226,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 		return nil, err
 	}
 	recordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+	log.Debugf("OpenAICompatExecutor ExecuteStream: HTTP Response status: %d, headers: %v", httpResp.StatusCode, httpResp.Header)
 	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
 		b, _ := io.ReadAll(httpResp.Body)
 		appendAPIResponseChunk(ctx, e.cfg, b)
-		log.Debugf("request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
+		log.Debugf("OpenAICompatExecutor ExecuteStream: request error, error status: %d, error body: %s", httpResp.StatusCode, summarizeErrorBody(httpResp.Header.Get("Content-Type"), b))
 		if errClose := httpResp.Body.Close(); errClose != nil {
 			log.Errorf("openai compat executor: close response body error: %v", errClose)
 		}
@@ -250,13 +259,15 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 				return
 			}
 
+			log.Debugf("OpenAICompatExecutor ExecuteStream: Web search response received, raw response: %s", string(body))
 			appendAPIResponseChunk(ctx, e.cfg, body)
 
-			// Translate the single web search response
-			// The response translator should handle web search response format
+			// Translate the single web search response to SSE events
+			// The response translator should handle web search response format and generate SSE events
 			var param any
 			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(opts.OriginalRequest), translated, body, &param)
 			for i := range chunks {
+				log.Debugf("OpenAICompatExecutor ExecuteStream: Web search SSE event chunk: %s", chunks[i])
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}
 		} else {

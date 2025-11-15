@@ -74,26 +74,49 @@ func ConvertOpenAIResponseToClaude(_ context.Context, modelName string, original
 			FinishReason:            "",
 			ContentBlocksStopped:    false,
 			MessageDeltaSent:        false,
+			MessageStarted:          false,
 		}
 	}
 
-	// Check if this is a web search response (non-streaming case)
-	// When handling streaming, the web search response should come as a single chunk
-	if isWebSearchResponse(rawJSON) || (bytes.HasPrefix(rawJSON, dataTag) && isWebSearchResponse(bytes.TrimSpace(rawJSON[5:]))) {
-		// For web search responses, create a single Claude message chunk
-		webSearchRaw := rawJSON
-		if bytes.HasPrefix(rawJSON, dataTag) {
-			webSearchRaw = bytes.TrimSpace(rawJSON[5:])
+	// Check if this is a web search response
+	// This can be either raw JSON (non-streaming context) or prefixed with dataTag (streaming context)
+	root := gjson.ParseBytes(rawJSON)
+	if root.Get("data").Exists() && root.Get("data").IsArray() {
+		// This is a web search response - treat it as SSE events for streaming contexts
+		return convertWebSearchResponseToClaudeSSE(rawJSON, modelName, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+	}
+
+	// Check if it's data-tag prefixed - if so, extract the JSON part
+	if bytes.HasPrefix(rawJSON, dataTag) {
+		jsonPart := bytes.TrimSpace(rawJSON[5:])
+		// Check if the content part is a web search response
+		if isWebSearchResponse(jsonPart) {
+			return convertWebSearchResponseToClaudeSSE(jsonPart, modelName, (*param).(*ConvertOpenAIResponseToAnthropicParams))
 		}
 
-		converted := convertWebSearchResponseToClaude(webSearchRaw, modelName)
-		return []string{converted}
+		rawJSON = jsonPart
+	} else if bytes.HasPrefix(rawJSON, []byte("data: ")) {
+		// Handle different data prefix pattern if needed
+		jsonPart := bytes.TrimSpace(rawJSON[6:])
+		if isWebSearchResponse(jsonPart) {
+			return convertWebSearchResponseToClaudeSSE(jsonPart, modelName, (*param).(*ConvertOpenAIResponseToAnthropicParams))
+		}
 	}
 
-	if !bytes.HasPrefix(rawJSON, dataTag) {
-		return []string{}
+	// Non-web-search response handling continues normally
+	if !bytes.HasPrefix(rawJSON, dataTag) && !bytes.HasPrefix(rawJSON, []byte("data: ")) {
+		if bytes.HasPrefix(rawJSON, []byte("[DONE]")) || string(rawJSON) == "[DONE]" {
+			return convertOpenAIDoneToAnthropic((*param).(*ConvertOpenAIResponseToAnthropicParams))
+		}
+		return convertOpenAINonStreamingToAnthropic(rawJSON)
 	}
-	rawJSON = bytes.TrimSpace(rawJSON[5:])
+
+	// Trim data tag if present
+	if bytes.HasPrefix(rawJSON, dataTag) {
+		rawJSON = bytes.TrimSpace(rawJSON[5:])
+	} else if bytes.HasPrefix(rawJSON, []byte("data: ")) {
+		rawJSON = bytes.TrimSpace(rawJSON[6:])
+	}
 
 	// Check if this is the [DONE] marker
 	rawStr := strings.TrimSpace(string(rawJSON))
@@ -671,8 +694,164 @@ func isWebSearchResponse(rawJSON []byte) bool {
 	return root.Get("data").Exists() && root.Get("data").IsArray()
 }
 
+// convertWebSearchResponseToClaudeSSE converts a web search response to Claude SSE events
+func convertWebSearchResponseToClaudeSSE(rawJSON []byte, originalModelName string, param *ConvertOpenAIResponseToAnthropicParams) []string {
+	root := gjson.ParseBytes(rawJSON)
+
+	var results []string
+
+	// Initialize message ID and other fields if not already done
+	if param.MessageID == "" {
+		param.MessageID = generateMessageID()
+	}
+	if param.Model == "" {
+		param.Model = originalModelName
+	}
+
+	// Only send message_start if we haven't sent it yet
+	if !param.MessageStarted {
+		// Create message_start event
+		messageStart := map[string]interface{}{
+			"type": "message_start",
+			"message": map[string]interface{}{
+				"id":            param.MessageID,
+				"type":          "message",
+				"role":          "assistant",
+				"model":         param.Model,
+				"content":       []interface{}{},
+				"stop_reason":   nil,
+				"stop_sequence": nil,
+				"usage": map[string]interface{}{
+					"input_tokens":  0,
+					"output_tokens": 0,
+				},
+			},
+		}
+		messageStartJSON, _ := json.Marshal(messageStart)
+		results = append(results, "event: message_start\ndata: "+string(messageStartJSON)+"\n\n")
+		param.MessageStarted = true
+	}
+
+	// Get search results from "data" array
+	contentText := ""
+	dataResults := root.Get("data")
+	if dataResults.Exists() && dataResults.IsArray() {
+		resultsArray := dataResults.Array()
+		if len(resultsArray) > 0 {
+			// Create a summary content text with search results
+			var searchSummary strings.Builder
+			for i, result := range resultsArray {
+				if i > 0 {
+					searchSummary.WriteString("\n\n") // Separate results clearly
+				}
+
+				title := result.Get("title").String()
+				url := result.Get("url").String()
+				abstract := result.Get("abstractInfo").String()
+
+				// Add the result to summary
+				if title != "" {
+					searchSummary.WriteString("## ")
+					searchSummary.WriteString(title)
+					searchSummary.WriteString("\n")
+				}
+				if url != "" {
+					searchSummary.WriteString("URL: ")
+					searchSummary.WriteString(url)
+					searchSummary.WriteString("\n")
+				}
+				if abstract != "" {
+					// Limit the abstract length to avoid very long responses
+					cleanAbstract := strings.ReplaceAll(abstract, "<[^>]*>", "") // Remove HTML tags
+					if len(cleanAbstract) > 500 {
+						cleanAbstract = cleanAbstract[:500] + "..."
+					}
+					searchSummary.WriteString(cleanAbstract)
+				}
+			}
+			contentText = searchSummary.String()
+		}
+	}
+
+	// Send content_block_start
+	if contentText != "" {
+		contentBlockStart := map[string]interface{}{
+			"type":  "content_block_start",
+			"index": 0,
+			"content_block": map[string]interface{}{
+				"type": "text",
+				"text": "",
+			},
+		}
+		contentBlockStartJSON, _ := json.Marshal(contentBlockStart)
+		results = append(results, "event: content_block_start\ndata: "+string(contentBlockStartJSON)+"\n\n")
+
+		// Send content_block_delta with the content in chunks (to simulate streaming)
+		if len(contentText) > 0 {
+			// Break content into smaller chunks to better simulate streaming
+			// Break content into reasonable-sized chunks to simulate streaming (avoiding tiny chunks)
+			charsPerChunk := 100
+			for i := 0; i < len(contentText); i += charsPerChunk {
+				end := i + charsPerChunk
+				if end > len(contentText) {
+					end = len(contentText)
+				}
+				chunk := contentText[i:end]
+
+				contentDelta := map[string]interface{}{
+					"type":  "content_block_delta",
+					"index": 0,
+					"delta": map[string]interface{}{
+						"type": "text_delta",
+						"text": chunk,
+					},
+				}
+				contentDeltaJSON, _ := json.Marshal(contentDelta)
+				results = append(results, "event: content_block_delta\ndata: "+string(contentDeltaJSON)+"\n\n")
+
+				// Accumulate content
+				param.ContentAccumulator.WriteString(chunk)
+			}
+		}
+
+		// Send content_block_stop
+		contentBlockStop := map[string]interface{}{
+			"type":  "content_block_stop",
+			"index": 0,
+		}
+		contentBlockStopJSON, _ := json.Marshal(contentBlockStop)
+		results = append(results, "event: content_block_stop\ndata: "+string(contentBlockStopJSON)+"\n\n")
+
+		param.ContentBlocksStopped = true
+	}
+
+	// Send message_delta with stop reason and usage
+	messageDelta := map[string]interface{}{
+		"type": "message_delta",
+		"delta": map[string]interface{}{
+			"stop_reason":   "end_turn",
+			"stop_sequence": nil,
+		},
+		"usage": map[string]interface{}{
+			"output_tokens": len(contentText) / 4, // Rough approximation of tokens (4 chars per token)
+		},
+	}
+	messageDeltaJSON, _ := json.Marshal(messageDelta)
+	results = append(results, "event: message_delta\ndata: "+string(messageDeltaJSON)+"\n\n")
+	param.MessageDeltaSent = true
+
+	// Send message_stop event
+	messageStop := map[string]interface{}{
+		"type": "message_stop",
+	}
+	messageStopJSON, _ := json.Marshal(messageStop)
+	results = append(results, "event: message_stop\ndata: "+string(messageStopJSON)+"\n\n")
+
+	return results
+}
+
 // convertWebSearchResponseToClaude converts a web search response (like from /chat/retrieve)
-// to Claude-compatible message format
+// to Claude-compatible message format (the complete message, used in non-streaming contexts)
 func convertWebSearchResponseToClaude(rawJSON []byte, originalModelName string) string {
 	root := gjson.ParseBytes(rawJSON)
 
